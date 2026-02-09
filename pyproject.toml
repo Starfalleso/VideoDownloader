@@ -1,0 +1,13 @@
+[project]
+name = "video-downloader"
+version = "0.1.0"
+description = "Universal video downloader GUI built with PySide6 and yt-dlp."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyside6>=6.7.0",
+    "yt-dlp>=2025.1.0",
+]
+
+[project.scripts]
+video-downloader = "main:main"
