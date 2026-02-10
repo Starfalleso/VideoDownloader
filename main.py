@@ -161,7 +161,7 @@ class MainWindow(QMainWindow):
         self.current_row: int | None = None
         self.queue_running = False
         self.stop_queue_requested = False
-        self.dark_mode = False
+        self.dark_mode = True
         self._intro_animation: QPropertyAnimation | None = None
         self._intro_played = False
 
@@ -212,9 +212,10 @@ class MainWindow(QMainWindow):
         self.clear_finished_button.setObjectName("secondaryButton")
         self.clear_finished_button.clicked.connect(self.clear_finished_items)
 
-        self.theme_button = QPushButton("Dark Theme")
+        self.theme_button = QPushButton("Light Theme")
         self.theme_button.setObjectName("secondaryButton")
         self.theme_button.setCheckable(True)
+        self.theme_button.setChecked(True)
         self.theme_button.clicked.connect(self.toggle_theme)
 
         self.progress_bar = QProgressBar()
