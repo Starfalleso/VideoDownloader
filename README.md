@@ -1,3 +1,13 @@
+
+<img width="1192" height="997" alt="Exemplo" src="https://github.com/user-attachments/assets/b330e253-9fab-408b-ae67-a86dba85c925" />
+
+
+
+
+
+
+
+
 # Universal Video Downloader (PySide6)
 
 Desktop video downloader for:
