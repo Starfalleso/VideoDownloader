@@ -1,9 +1,12 @@
 import os
+import time
 import re
 import sys
+from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QThread, Qt, Signal
+from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QThread, Qt, Signal, QEvent, QTimer, QPointF
+from PySide6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QLinearGradient, QAction, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -23,6 +26,10 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QSlider,
+    QSystemTrayIcon,
+    QMenu,
+    QStyle,
 )
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -52,23 +59,27 @@ QUALITY_PRESETS = {
 
 
 class DownloadWorker(QObject):
-    progress = Signal(float, str)
-    log = Signal(str)
-    finished = Signal(bool, str)
+    progress = Signal(int, float, str)
+    log = Signal(int, str)
+    finished = Signal(int, bool, str)
+    speed_updated = Signal(int, float)
 
     def __init__(
         self,
+        row: int,
         url: str,
         output_dir: str,
         cookie_file: str = "",
-        quality_preset: str = "Best (Video + Audio)",
+        quality_preset = "Best (Video + Audio)",
     ):
         super().__init__()
+        self.row = row
         self.url = url
         self.output_dir = output_dir
         self.cookie_file = cookie_file
         self.quality_preset = quality_preset
         self._cancelled = False
+        self.last_update_time = 0.0
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -78,22 +89,32 @@ class DownloadWorker(QObject):
             raise DownloadError("Download canceled by user.")
 
         status = data.get("status", "")
+        current_time = time.time()
+        
         if status == "downloading":
+            # Rate limit to 10Hz (every 100ms) to prevent GUI thread event flooding
+            if current_time - self.last_update_time < 0.1:
+                return
+            self.last_update_time = current_time
+
             downloaded = data.get("downloaded_bytes", 0)
             total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+            speed = data.get("speed")
+            if isinstance(speed, (int, float)):
+                self.speed_updated.emit(self.row, float(speed))
+            
             if total > 0:
                 percent = (downloaded / total) * 100
-                speed = data.get("speed")
                 eta = data.get("eta")
                 speed_text = (
                     f"{speed / 1024 / 1024:.2f} MB/s" if isinstance(speed, (int, float)) else "N/A"
                 )
                 eta_text = f"{eta}s" if isinstance(eta, int) else "N/A"
-                self.progress.emit(percent, f"{percent:.1f}% | {speed_text} | ETA: {eta_text}")
+                self.progress.emit(self.row, percent, f"{percent:.1f}% | {speed_text} | ETA: {eta_text}")
             else:
-                self.progress.emit(0, "Downloading...")
+                self.progress.emit(self.row, 0.0, "Downloading...")
         elif status == "finished":
-            self.progress.emit(100, "Download complete, processing file...")
+            self.progress.emit(self.row, 100.0, "Download complete, processing file...")
 
     def run(self) -> None:
         try:
@@ -109,40 +130,187 @@ class DownloadWorker(QObject):
                 "no_warnings": True,
             }
 
-            preset = QUALITY_PRESETS.get(
-                self.quality_preset, QUALITY_PRESETS["Best (Video + Audio)"]
-            )
-            ydl_opts["format"] = preset["format"]
+            if isinstance(self.quality_preset, dict):
+                preset = self.quality_preset
+            else:
+                preset = QUALITY_PRESETS.get(
+                    self.quality_preset, QUALITY_PRESETS["Best (Video + Audio)"]
+                )
+            
+            ydl_opts["format"] = preset.get("format") or preset.get("format_id")
             if "merge_output_format" in preset:
                 ydl_opts["merge_output_format"] = preset["merge_output_format"]
             if "postprocessors" in preset:
                 ydl_opts["postprocessors"] = list(preset["postprocessors"])
 
-            self.log.emit(f"Quality: {self.quality_preset}")
+            # Support presenting name or preset string in logs
+            preset_name = preset.get("name") if isinstance(self.quality_preset, dict) else self.quality_preset
+            self.log.emit(self.row, f"Format: {preset_name}")
             if self.cookie_file and Path(self.cookie_file).exists():
                 ydl_opts["cookiefile"] = self.cookie_file
-                self.log.emit("Using cookies file for authenticated download.")
+                self.log.emit(self.row, "Using cookies file for authenticated download.")
 
-            self.log.emit("Fetching video info...")
+            self.log.emit(self.row, "Fetching video info...")
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(self.url, download=False)
                 title = sanitize_filename(info.get("title", "video"))
-                self.log.emit(f"Title: {title}")
-                self.log.emit("Starting download...")
+                self.log.emit(self.row, f"Title: {title}")
+                self.log.emit(self.row, "Starting download...")
                 ydl.download([self.url])
 
             if self._cancelled:
-                self.finished.emit(False, "Download canceled.")
+                self.finished.emit(self.row, False, "Download canceled.")
                 return
 
-            self.finished.emit(True, "Download completed successfully.")
+            self.finished.emit(self.row, True, "Download completed successfully.")
         except DownloadError as exc:
             if self._cancelled:
-                self.finished.emit(False, "Download canceled.")
+                self.finished.emit(self.row, False, "Download canceled.")
             else:
-                self.finished.emit(False, f"Download failed: {exc}")
+                self.finished.emit(self.row, False, f"Download failed: {exc}")
         except Exception as exc:
-            self.finished.emit(False, f"Error: {exc}")
+            self.finished.emit(self.row, False, f"Error: {exc}")
+
+
+class FormatAnalyzerWorker(QObject):
+    finished = Signal(bool, list, str) # success, formats, error_msg
+
+    def __init__(self, url: str, cookie_file: str = ""):
+        super().__init__()
+        self.url = url
+        self.cookie_file = cookie_file
+
+    def run(self) -> None:
+        try:
+            ydl_opts = {
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+            }
+            if self.cookie_file and Path(self.cookie_file).exists():
+                ydl_opts["cookiefile"] = self.cookie_file
+
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+                formats_list = info.get("formats", [])
+                
+                parsed_formats = []
+                seen_heights = set()
+                
+                for f in formats_list:
+                    height = f.get("height")
+                    ext = f.get("ext", "")
+                    if height and height >= 144:
+                        key = (height, ext)
+                        if key not in seen_heights:
+                            seen_heights.add(key)
+                            filesize = f.get("filesize") or f.get("filesize_approx")
+                            size_str = f" (~{filesize / 1024 / 1024:.1f} MB)" if filesize else ""
+                            parsed_formats.append({
+                                "name": f"{height}p ({ext.upper()}){size_str}",
+                                "format_id": f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
+                                "merge_output_format": ext if ext in ("mp4", "mkv") else "mp4"
+                            })
+
+                # Extract audio
+                audio_formats = [f for f in formats_list if f.get("vcodec") == "none" and f.get("acodec") != "none"]
+                if audio_formats:
+                    best_audio = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
+                    filesize = best_audio.get("filesize") or best_audio.get("filesize_approx")
+                    size_str = f" (~{filesize / 1024 / 1024:.1f} MB)" if filesize else ""
+                    parsed_formats.append({
+                        "name": f"Audio Only (MP3/M4A){size_str}",
+                        "format_id": "bestaudio/best",
+                        "postprocessors": [
+                            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+                        ]
+                    })
+                
+                parsed_formats.sort(key=lambda x: 0 if "Audio" in x["name"] else int(x["name"].split("p")[0]), reverse=True)
+                
+                if not parsed_formats:
+                    parsed_formats = [{"name": name, "format_id": val["format"]} for name, val in QUALITY_PRESETS.items()]
+
+                self.finished.emit(True, parsed_formats, "")
+        except Exception as e:
+            self.finished.emit(False, [], str(e))
+
+
+class SpeedChartWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.history = [0.0] * 30
+        self.setMinimumHeight(120)
+
+    def add_sample(self, speed_bytes: float) -> None:
+        speed_mb = speed_bytes / 1024 / 1024
+        self.history.pop(0)
+        self.history.append(speed_mb)
+        self.update()
+
+    def clear_history(self) -> None:
+        self.history = [0.0] * 30
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+
+        painter.fillRect(0, 0, width, height, QColor(0, 0, 0, 0))
+
+        if not self.history:
+            return
+
+        max_val = max(self.history)
+        if max_val < 1.0:
+            max_val = 1.0
+
+        points = []
+        step_x = width / (len(self.history) - 1)
+        
+        for i, val in enumerate(self.history):
+            x = i * step_x
+            y = height - (val / max_val) * (height - 20) - 10
+            points.append(QPointF(x, y))
+
+        grid_pen = QPen(QColor(100, 116, 139, 40), 1, Qt.DashLine)
+        painter.setPen(grid_pen)
+        for i in range(1, 4):
+            y_grid = i * (height / 4)
+            painter.drawLine(0, y_grid, width, y_grid)
+
+        text_color = QColor(148, 163, 184, 180)
+        painter.setPen(text_color)
+        painter.setFont(self.font())
+        painter.drawText(8, 18, f"Max: {max_val:.1f} MB/s")
+
+        path = QPainterPath()
+        path.moveTo(0, height)
+        for pt in points:
+            path.lineTo(pt)
+        path.lineTo(width, height)
+        path.closeSubpath()
+
+        grad = QLinearGradient(0, 0, 0, height)
+        grad.setColorAt(0, QColor(99, 102, 241, 100))
+        grad.setColorAt(1, QColor(99, 102, 241, 0))
+        painter.setBrush(QBrush(grad))
+        painter.setPen(Qt.NoPen)
+        painter.drawPath(path)
+
+        curve_pen = QPen(QColor(99, 102, 241), 2)
+        painter.setPen(curve_pen)
+        painter.setBrush(Qt.NoBrush)
+        
+        line_path = QPainterPath()
+        if points:
+            line_path.moveTo(points[0])
+            for pt in points[1:]:
+                line_path.lineTo(pt)
+        painter.drawPath(line_path)
 
 
 class MainWindow(QMainWindow):
@@ -155,15 +323,36 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Universal Video Downloader")
         self.resize(980, 720)
+        self.setAcceptDrops(True)
 
-        self.thread: QThread | None = None
-        self.worker: DownloadWorker | None = None
-        self.current_row: int | None = None
+        # Force custom taskbar icon on Windows
+        try:
+            import ctypes
+            myappid = "starfalleso.videodownloader.pyside.1"
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass
+
+        # Set Window Icon
+        icon_path = Path("icon.ico")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+        else:
+            self.setWindowIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+
+        # Concurrent Queue State
+        self.active_downloads = {}  # maps row index -> {"thread": QThread, "worker": DownloadWorker}
+        self.active_speeds = {}     # maps row -> float (bytes/sec)
+        self.max_concurrent = 2
         self.queue_running = False
         self.stop_queue_requested = False
         self.dark_mode = True
         self._intro_animation: QPropertyAnimation | None = None
         self._intro_played = False
+
+        # Format analyzer thread & worker
+        self.analyzer_thread = None
+        self.analyzer_worker = None
 
         self.url_input = QLineEdit()
         self.url_input.setObjectName("urlInput")
@@ -171,6 +360,16 @@ class MainWindow(QMainWindow):
         self.url_input.setPlaceholderText(
             "Paste TikTok / YouTube / Instagram / Twitter(X) video URL..."
         )
+
+        self.paste_button = QPushButton("📋 Paste")
+        self.paste_button.setObjectName("secondaryButton")
+        self.paste_button.setFixedWidth(70)
+        self.paste_button.clicked.connect(self.paste_clipboard)
+
+        self.analyze_button = QPushButton("🔍 Analyze")
+        self.analyze_button.setObjectName("secondaryButton")
+        self.analyze_button.setFixedWidth(85)
+        self.analyze_button.clicked.connect(self.analyze_url)
 
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(list(QUALITY_PRESETS.keys()))
@@ -212,7 +411,7 @@ class MainWindow(QMainWindow):
         self.clear_finished_button.setObjectName("secondaryButton")
         self.clear_finished_button.clicked.connect(self.clear_finished_items)
 
-        self.theme_button = QPushButton("Light Theme")
+        self.theme_button = QPushButton("☀️ Light Mode")
         self.theme_button.setObjectName("secondaryButton")
         self.theme_button.setCheckable(True)
         self.theme_button.setChecked(True)
@@ -247,22 +446,39 @@ class MainWindow(QMainWindow):
         self.queue_table.setAlternatingRowColors(True)
         self.queue_table.verticalHeader().setVisible(False)
         header = self.queue_table.horizontalHeader()
-        header.setSectionResizeMode(self.COL_URL, QHeaderView.Interactive)
+        header.setSectionResizeMode(self.COL_URL, QHeaderView.Stretch)
         header.setSectionResizeMode(self.COL_QUALITY, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_PROGRESS, QHeaderView.ResizeToContents)
-        self.queue_table.setColumnWidth(self.COL_URL, 540)
         self.queue_table.itemSelectionChanged.connect(self._update_queue_buttons)
+
+        # System Tray Icon Setup
+        self.tray_icon = QSystemTrayIcon(self)
+        icon_path = Path("icon.ico")
+        if icon_path.exists():
+            self.tray_icon.setIcon(QIcon(str(icon_path)))
+        else:
+            self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+        
+        tray_menu = QMenu()
+        restore_action = tray_menu.addAction("Restore")
+        restore_action.triggered.connect(self.showNormal)
+        restore_action.triggered.connect(self.activateWindow)
+        exit_action = tray_menu.addAction("Exit")
+        exit_action.triggered.connect(QApplication.instance().quit)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
 
         central = QWidget(objectName="root")
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(26, 24, 26, 24)
+        main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(14)
 
         header_card = QFrame(objectName="headerCard")
         header_layout = QVBoxLayout(header_card)
-        header_layout.setContentsMargins(20, 18, 20, 18)
-        header_layout.setSpacing(8)
+        header_layout.setContentsMargins(18, 14, 18, 14)
+        header_layout.setSpacing(6)
 
         title_label = QLabel("Universal Video Downloader", objectName="titleLabel")
         subtitle_label = QLabel(
@@ -292,8 +508,15 @@ class MainWindow(QMainWindow):
         input_layout = QVBoxLayout(input_card)
         input_layout.setContentsMargins(16, 16, 16, 16)
         input_layout.setSpacing(10)
+
+        url_layout = QHBoxLayout()
+        url_layout.setSpacing(6)
+        url_layout.addWidget(self.url_input, 1)
+        url_layout.addWidget(self.paste_button)
+        url_layout.addWidget(self.analyze_button)
+
         input_layout.addWidget(QLabel("Video URL", objectName="fieldLabel"))
-        input_layout.addWidget(self.url_input)
+        input_layout.addLayout(url_layout)
         input_layout.addWidget(QLabel("Quality / Format", objectName="fieldLabel"))
         input_layout.addWidget(self.quality_combo)
         input_layout.addWidget(QLabel("Save To", objectName="fieldLabel"))
@@ -331,6 +554,25 @@ class MainWindow(QMainWindow):
         controls_layout.setContentsMargins(16, 16, 16, 16)
         controls_layout.setSpacing(10)
 
+        concurrency_layout = QHBoxLayout()
+        concurrency_layout.setSpacing(10)
+        concurrency_layout.addWidget(QLabel("Max Parallel Downloads:", objectName="fieldLabel"))
+        
+        self.concurrency_slider = QSlider(Qt.Horizontal)
+        self.concurrency_slider.setRange(1, 5)
+        self.concurrency_slider.setValue(2)
+        self.concurrency_slider.setTickPosition(QSlider.TicksBelow)
+        self.concurrency_slider.setTickInterval(1)
+        self.concurrency_slider.setFixedHeight(22)
+        
+        self.concurrency_label = QLabel("2", objectName="fieldLabel")
+        self.concurrency_label.setFixedWidth(20)
+        self.concurrency_label.setAlignment(Qt.AlignCenter)
+        self.concurrency_slider.valueChanged.connect(self.update_concurrency_value)
+
+        concurrency_layout.addWidget(self.concurrency_slider, 1)
+        concurrency_layout.addWidget(self.concurrency_label)
+
         button_layout = QHBoxLayout()
         button_layout.setSpacing(10)
         button_layout.addWidget(self.enqueue_button, 1)
@@ -342,6 +584,7 @@ class MainWindow(QMainWindow):
         status_row.addWidget(self.status_label, 0)
         status_row.addWidget(self.progress_bar, 1)
 
+        controls_layout.addLayout(concurrency_layout)
         controls_layout.addLayout(button_layout)
         controls_layout.addLayout(status_row)
 
@@ -351,13 +594,38 @@ class MainWindow(QMainWindow):
         log_layout.setSpacing(8)
         log_layout.addWidget(QLabel("Activity Log", objectName="fieldLabel"))
         log_layout.addWidget(self.log_box)
-        self.log_box.setMinimumHeight(220)
+        self.log_box.setMinimumHeight(140)
+
+        chart_card = QFrame(objectName="card")
+        chart_layout = QVBoxLayout(chart_card)
+        chart_layout.setContentsMargins(16, 12, 16, 12)
+        chart_layout.setSpacing(6)
+        chart_layout.addWidget(QLabel("Download Speed Chart", objectName="fieldLabel"))
+
+        self.speed_chart = SpeedChartWidget()
+        chart_layout.addWidget(self.speed_chart)
+
+        # Build dashboard split layout
+        body_layout = QHBoxLayout()
+        body_layout.setSpacing(14)
+
+        left_column = QVBoxLayout()
+        left_column.setSpacing(14)
+        left_column.addWidget(input_card)
+        left_column.addWidget(controls_card)
+        left_column.addWidget(chart_card)
+        left_column.addStretch()
+
+        right_column = QVBoxLayout()
+        right_column.setSpacing(14)
+        right_column.addWidget(queue_card, 3)
+        right_column.addWidget(log_card, 2)
+
+        body_layout.addLayout(left_column, 2)
+        body_layout.addLayout(right_column, 3)
 
         main_layout.addWidget(header_card)
-        main_layout.addWidget(input_card)
-        main_layout.addWidget(queue_card, 1)
-        main_layout.addWidget(controls_card)
-        main_layout.addWidget(log_card)
+        main_layout.addLayout(body_layout)
 
         self.apply_styles()
         self.setCentralWidget(central)
@@ -365,7 +633,7 @@ class MainWindow(QMainWindow):
 
     def _make_chip(self, text: str) -> QLabel:
         chip = QLabel(text)
-        chip.setObjectName("platformChip")
+        chip.setObjectName(f"chip_{text.replace('/', '_').lower()}")
         chip.setAlignment(Qt.AlignCenter)
         return chip
 
@@ -374,65 +642,99 @@ class MainWindow(QMainWindow):
             QWidget#root {
                 background: qlineargradient(
                     x1: 0, y1: 0, x2: 1, y2: 1,
-                    stop: 0 #f4f9ff,
-                    stop: 0.55 #fbfcfe,
-                    stop: 1 #fff7ed
+                    stop: 0 #f8fafc,
+                    stop: 0.6 #f1f5f9,
+                    stop: 1 #e2e8f0
                 );
             }
             QFrame#headerCard, QFrame#card {
-                background-color: rgba(255, 255, 255, 230);
-                border: 1px solid #d9e3f0;
-                border-radius: 16px;
+                background-color: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
             }
             QLabel {
-                color: #233042;
-                font-family: "Trebuchet MS";
+                color: #0f172a;
+                font-family: "Segoe UI", Arial, sans-serif;
             }
             QLabel#titleLabel {
-                font-family: "Bahnschrift SemiBold";
-                color: #18283b;
-                font-size: 28px;
-                letter-spacing: 0.4px;
+                font-family: "Segoe UI", Arial, sans-serif;
+                font-weight: 700;
+                color: #0f172a;
+                font-size: 24px;
+                letter-spacing: -0.5px;
             }
             QLabel#subtitleLabel {
-                color: #4f637c;
-                font-size: 14px;
+                color: #475569;
+                font-size: 13px;
             }
             QLabel#fieldLabel {
-                color: #344861;
-                font-size: 12px;
-                font-weight: 600;
+                color: #64748b;
+                font-size: 11px;
+                font-weight: 700;
                 text-transform: uppercase;
                 letter-spacing: 0.8px;
             }
-            QLabel#platformChip {
-                border: 1px solid #bfd2ea;
-                background-color: #eff6ff;
-                border-radius: 11px;
+            
+            /* Platform Chips Light Mode */
+            QLabel#chip_tiktok {
+                border: 1px solid #99f6e4;
+                background-color: #f0fdfa;
+                color: #0d9488;
+                border-radius: 10px;
                 padding: 3px 10px;
-                color: #214a7a;
                 font-size: 11px;
                 font-weight: 600;
             }
-            QLineEdit {
-                background: #ffffff;
-                border: 1px solid #c4d4e9;
+            QLabel#chip_youtube {
+                border: 1px solid #fecaca;
+                background-color: #fef2f2;
+                color: #dc2626;
                 border-radius: 10px;
-                padding: 10px 12px;
-                color: #1f2f45;
+                padding: 3px 10px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QLabel#chip_instagram {
+                border: 1px solid #fed7aa;
+                background-color: #fff7ed;
+                color: #ea580c;
+                border-radius: 10px;
+                padding: 3px 10px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QLabel#chip_twitter_x {
+                border: 1px solid #e2e8f0;
+                background-color: #f8fafc;
+                color: #475569;
+                border-radius: 10px;
+                padding: 3px 10px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+
+            QLineEdit {
+                background: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 8px 12px;
+                color: #0f172a;
                 font-size: 13px;
-                selection-background-color: #5ca7ff;
+                font-family: "Segoe UI", Arial, sans-serif;
+                selection-background-color: #a5b4fc;
             }
             QLineEdit:focus {
-                border: 2px solid #4c8fe3;
+                border: 1px solid #6366f1;
+                background: #ffffff;
             }
             QComboBox {
-                background: #ffffff;
-                border: 1px solid #c4d4e9;
-                border-radius: 10px;
-                padding: 9px 12px;
-                color: #1f2f45;
+                background: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 8px 12px;
+                color: #0f172a;
                 font-size: 13px;
+                font-family: "Segoe UI", Arial, sans-serif;
             }
             QComboBox::drop-down {
                 border: none;
@@ -443,163 +745,205 @@ class MainWindow(QMainWindow):
                 height: 0px;
                 border-left: 5px solid transparent;
                 border-right: 5px solid transparent;
-                border-top: 7px solid #4f6f94;
+                border-top: 6px solid #64748b;
                 margin-right: 8px;
             }
             QComboBox QAbstractItemView {
-                border: 1px solid #c4d4e9;
+                border: 1px solid #e2e8f0;
                 background: #ffffff;
-                color: #1f2f45;
-                selection-background-color: #d9ecff;
-                selection-color: #1f2f45;
+                color: #0f172a;
+                selection-background-color: #e0e7ff;
+                selection-color: #3730a3;
                 outline: 0;
             }
             QComboBox QAbstractItemView::item {
                 background: #ffffff;
-                color: #1f2f45;
+                color: #0f172a;
                 min-height: 22px;
                 padding: 5px 8px;
             }
             QComboBox QAbstractItemView::item:selected {
-                background: #d9ecff;
-                color: #1f2f45;
+                background: #e0e7ff;
+                color: #3730a3;
             }
             QPushButton {
-                border-radius: 10px;
-                padding: 9px 14px;
-                font-family: "Trebuchet MS";
+                border-radius: 8px;
+                padding: 8px 14px;
+                font-family: "Segoe UI", Arial, sans-serif;
                 font-size: 13px;
-                font-weight: 700;
+                font-weight: 600;
             }
             QPushButton#primaryButton {
-                background-color: #1877f2;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #4f46e5, stop: 1 #7c3aed
+                );
                 color: #ffffff;
-                border: 1px solid #156bda;
+                border: none;
             }
             QPushButton#primaryButton:hover {
-                background-color: #1168d9;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #4338ca, stop: 1 #6d28d9
+                );
             }
             QPushButton#secondaryButton {
                 background-color: #ffffff;
-                color: #27507f;
-                border: 1px solid #b9cce5;
+                color: #475569;
+                border: 1px solid #cbd5e1;
             }
             QPushButton#secondaryButton:hover {
-                background-color: #edf4ff;
+                background-color: #f1f5f9;
+                color: #0f172a;
+                border-color: #94a3b8;
+            }
+            QPushButton#secondaryButton:checked {
+                background-color: #e0e7ff;
+                color: #3730a3;
+                border-color: #6366f1;
             }
             QPushButton#dangerButton {
-                background-color: #fff4f2;
-                color: #b53a2f;
-                border: 1px solid #f1c3be;
+                background-color: #fef2f2;
+                color: #991b1b;
+                border: 1px solid #fca5a5;
             }
             QPushButton#dangerButton:hover {
-                background-color: #ffe7e2;
+                background-color: #fee2e2;
+                border-color: #f87171;
             }
             QPushButton:disabled {
-                background-color: #eef2f7;
-                color: #8ea1b9;
-                border: 1px solid #dde4ed;
+                background-color: #f1f5f9;
+                color: #94a3b8;
+                border: 1px solid #e2e8f0;
             }
             QLabel#statusPill {
-                min-width: 170px;
-                border-radius: 13px;
+                min-width: 150px;
+                border-radius: 8px;
                 padding: 6px 10px;
                 font-size: 12px;
-                font-weight: 700;
-                color: #1f3f66;
-                background-color: #e6f1ff;
-                border: 1px solid #b8d0ec;
+                font-weight: 600;
+                color: #475569;
+                background-color: #f1f5f9;
+                border: 1px solid #cbd5e1;
             }
             QLabel#statusPill[state="active"] {
-                color: #1f3f66;
-                background-color: #dff0ff;
-                border: 1px solid #9fc7ee;
+                color: #3730a3;
+                background-color: #e0e7ff;
+                border: 1px solid #a5b4fc;
             }
             QLabel#statusPill[state="success"] {
-                color: #1f6a3b;
-                background-color: #e8f9ee;
-                border: 1px solid #a6ddb6;
+                color: #166534;
+                background-color: #dcfce7;
+                border: 1px solid #86efac;
             }
             QLabel#statusPill[state="warning"] {
-                color: #8a5a12;
-                background-color: #fff5e5;
-                border: 1px solid #f5d49b;
+                color: #92400e;
+                background-color: #fef3c7;
+                border: 1px solid #fcd34d;
             }
             QLabel#statusPill[state="error"] {
-                color: #8f2720;
-                background-color: #ffe8e5;
-                border: 1px solid #efc0bb;
+                color: #991b1b;
+                background-color: #fee2e2;
+                border: 1px solid #fca5a5;
             }
             QProgressBar {
-                border: 1px solid #c7d7eb;
-                border-radius: 10px;
-                height: 22px;
-                background: #edf3fa;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                height: 18px;
+                background: #f1f5f9;
             }
             QProgressBar::chunk {
-                border-radius: 9px;
+                border-radius: 7px;
                 background: qlineargradient(
                     x1: 0, y1: 0, x2: 1, y2: 0,
-                    stop: 0 #35a6ff, stop: 1 #1570ef
+                    stop: 0 #6366f1, stop: 1 #3b82f6
                 );
             }
             QPlainTextEdit#logBox {
-                background-color: #f9fbff;
-                border: 1px solid #d2deee;
-                border-radius: 10px;
+                background-color: #0f172a;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
                 padding: 8px;
-                color: #233042;
-                font-family: "Consolas";
-                font-size: 12px;
+                color: #38bdf8;
+                font-family: "Consolas", monospace;
+                font-size: 11px;
             }
             QTableWidget {
                 background-color: #ffffff;
-                border: 1px solid #d2deee;
-                border-radius: 10px;
-                gridline-color: #e2eaf5;
-                alternate-background-color: #f8fbff;
-                selection-background-color: #d9ecff;
-                selection-color: #1f2f45;
-                color: #233042;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                gridline-color: #f1f5f9;
+                alternate-background-color: #f8fafc;
+                selection-background-color: #e0e7ff;
+                selection-color: #3730a3;
+                color: #0f172a;
                 font-size: 12px;
             }
             QHeaderView::section {
-                background: #eef4fc;
-                color: #365070;
+                background: #f8fafc;
+                color: #475569;
                 border: none;
-                border-right: 1px solid #d7e2f0;
-                border-bottom: 1px solid #d7e2f0;
-                padding: 8px;
-                font-weight: 700;
+                border-right: 1px solid #e2e8f0;
+                border-bottom: 1px solid #e2e8f0;
+                padding: 6px;
+                font-weight: 600;
             }
-            QTableWidget QScrollBar:vertical {
-                background: #eef4fc;
-                width: 12px;
-                border-radius: 6px;
-                margin: 4px;
+            
+            /* Custom Scrollbars Light Mode */
+            QScrollBar:vertical {
+                background: #f1f5f9;
+                width: 8px;
+                border-radius: 4px;
+                margin: 0px;
             }
-            QTableWidget QScrollBar::handle:vertical {
-                background: #b8cbe4;
-                border-radius: 6px;
-                min-height: 24px;
+            QScrollBar::handle:vertical {
+                background: #cbd5e1;
+                border-radius: 4px;
+                min-height: 20px;
             }
-            QTableWidget QScrollBar:horizontal {
-                background: #eef4fc;
-                height: 12px;
-                border-radius: 6px;
-                margin: 4px;
+            QScrollBar::handle:vertical:hover {
+                background: #94a3b8;
             }
-            QTableWidget QScrollBar::handle:horizontal {
-                background: #b8cbe4;
-                border-radius: 6px;
-                min-width: 24px;
-            }
-            QTableWidget QScrollBar::add-line,
-            QTableWidget QScrollBar::sub-line {
-                width: 0px;
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                background: none;
                 height: 0px;
+            }
+            QScrollBar:horizontal {
+                background: #f1f5f9;
+                height: 8px;
+                border-radius: 4px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #cbd5e1;
+                border-radius: 4px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #94a3b8;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                background: none;
+                width: 0px;
+            }
+
+            /* Slider Light Mode */
+            QSlider::groove:horizontal {
+                border: 1px solid #cbd5e1;
+                height: 6px;
+                background: #f1f5f9;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #6366f1;
                 border: none;
-                background: transparent;
+                width: 14px;
+                height: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #4f46e5;
             }
             """
         if self.dark_mode:
@@ -607,164 +951,237 @@ class MainWindow(QMainWindow):
             QWidget#root {
                 background: qlineargradient(
                     x1: 0, y1: 0, x2: 1, y2: 1,
-                    stop: 0 #131a25,
-                    stop: 0.55 #161f2d,
-                    stop: 1 #1c2434
+                    stop: 0 #09090b,
+                    stop: 0.5 #18181b,
+                    stop: 1 #27272a
                 );
             }
             QFrame#headerCard, QFrame#card {
-                background-color: rgba(25, 34, 49, 232);
-                border: 1px solid #33445f;
+                background-color: #18181b;
+                border: 1px solid #27272a;
             }
             QLabel {
-                color: #d4e3f8;
+                color: #f4f4f5;
             }
             QLabel#titleLabel {
-                color: #ecf3ff;
+                color: #f4f4f5;
             }
             QLabel#subtitleLabel {
-                color: #9eb3d3;
+                color: #a1a1aa;
             }
             QLabel#fieldLabel {
-                color: #95abcf;
+                color: #71717a;
             }
-            QLabel#platformChip {
-                border: 1px solid #3e5580;
-                background-color: #22314b;
-                color: #c5d9f7;
+            
+            /* Platform Chips Dark Mode */
+            QLabel#chip_tiktok {
+                background-color: #113030;
+                border: 1px solid #2dd4bf;
+                color: #99f6e4;
             }
+            QLabel#chip_youtube {
+                background-color: #3f1b1b;
+                border: 1px solid #f87171;
+                color: #fca5a5;
+            }
+            QLabel#chip_instagram {
+                background-color: #382015;
+                border: 1px solid #fb923c;
+                color: #fed7aa;
+            }
+            QLabel#chip_twitter_x {
+                background-color: #27272a;
+                border: 1px solid #52525b;
+                color: #e4e4e7;
+            }
+            
             QLineEdit {
-                background: #1a2537;
-                border: 1px solid #3a4d70;
-                color: #d7e5fb;
-                selection-background-color: #2f71c8;
+                background: #09090b;
+                border: 1px solid #27272a;
+                color: #f4f4f5;
+                selection-background-color: #4f46e5;
             }
-            QLineEdit:focus {
-                border: 2px solid #4b8be1;
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #6366f1;
+                background: #09090b;
             }
             QComboBox {
-                background: #1a2537;
-                border: 1px solid #3a4d70;
-                color: #d7e5fb;
+                background: #09090b;
+                border: 1px solid #27272a;
+                color: #f4f4f5;
             }
             QComboBox::down-arrow {
-                border-top: 7px solid #9ab7de;
+                border-top: 6px solid #a1a1aa;
             }
             QComboBox QAbstractItemView {
-                border: 1px solid #3a4d70;
-                background: #1a2537;
-                color: #d7e5fb;
-                selection-background-color: #2b4872;
-                selection-color: #eaf3ff;
+                border: 1px solid #27272a;
+                background: #09090b;
+                color: #f4f4f5;
+                selection-background-color: #312e81;
+                selection-color: #e0e7ff;
             }
             QComboBox QAbstractItemView::item {
-                background: #1a2537;
-                color: #d7e5fb;
+                background: #09090b;
+                color: #f4f4f5;
             }
             QComboBox QAbstractItemView::item:selected {
-                background: #2b4872;
-                color: #eaf3ff;
+                background: #312e81;
+                color: #e0e7ff;
             }
             QPushButton#primaryButton {
-                background-color: #2f6fd8;
-                color: #edf4ff;
-                border: 1px solid #245ebd;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #6366f1, stop: 1 #8b5cf6
+                );
+                color: #ffffff;
+                border: none;
             }
             QPushButton#primaryButton:hover {
-                background-color: #2866cb;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #4f46e5, stop: 1 #7c3aed
+                );
             }
             QPushButton#secondaryButton {
-                background-color: #1f2a3d;
-                color: #c6daf8;
-                border: 1px solid #3d5479;
+                background-color: #27272a;
+                color: #e4e4e7;
+                border: 1px solid #3f3f46;
             }
             QPushButton#secondaryButton:hover {
-                background-color: #24334a;
+                background-color: #3f3f46;
+                color: #ffffff;
+                border-color: #52525b;
             }
             QPushButton#secondaryButton:checked {
-                background-color: #2a3f63;
-                color: #e7f0ff;
-                border: 1px solid #5781c2;
+                background-color: #312e81;
+                color: #e0e7ff;
+                border-color: #6366f1;
             }
             QPushButton#dangerButton {
-                background-color: #3a2227;
-                color: #ffb8b2;
-                border: 1px solid #774047;
+                background-color: #451a1a;
+                color: #fca5a5;
+                border: 1px solid #7f1d1d;
             }
             QPushButton#dangerButton:hover {
-                background-color: #46282e;
+                background-color: #7f1d1d;
+                border-color: #b91c1c;
             }
             QPushButton:disabled {
-                background-color: #1a2434;
-                color: #70839f;
-                border: 1px solid #2f3f57;
+                background-color: #1c1c1e;
+                color: #52525b;
+                border: 1px solid #27272a;
             }
             QLabel#statusPill {
-                color: #cde1ff;
-                background-color: #1f3553;
-                border: 1px solid #42638d;
+                color: #e4e4e7;
+                background-color: #27272a;
+                border: 1px solid #3f3f46;
             }
             QLabel#statusPill[state="active"] {
-                color: #cde1ff;
-                background-color: #22405f;
-                border: 1px solid #4d78a9;
+                color: #c7d2fe;
+                background-color: #1e1b4b;
+                border: 1px solid #3730a3;
             }
             QLabel#statusPill[state="success"] {
-                color: #c8f4d8;
-                background-color: #1e4733;
-                border: 1px solid #3e7a5e;
+                color: #a7f3d0;
+                background-color: #064e3b;
+                border: 1px solid #047857;
             }
             QLabel#statusPill[state="warning"] {
-                color: #ffe0b4;
-                background-color: #4d3a1f;
-                border: 1px solid #816637;
+                color: #fde68a;
+                background-color: #78350f;
+                border: 1px solid #b45309;
             }
             QLabel#statusPill[state="error"] {
-                color: #ffc8c2;
-                background-color: #54272b;
-                border: 1px solid #87454c;
+                color: #fecaca;
+                background-color: #7f1d1d;
+                border: 1px solid #b91c1c;
             }
             QProgressBar {
-                border: 1px solid #415474;
-                background: #182234;
+                border: 1px solid #27272a;
+                background: #09090b;
             }
             QProgressBar::chunk {
                 background: qlineargradient(
                     x1: 0, y1: 0, x2: 1, y2: 0,
-                    stop: 0 #3ea8ff, stop: 1 #2f73db
+                    stop: 0 #8b5cf6, stop: 1 #3b82f6
                 );
             }
             QPlainTextEdit#logBox {
-                background-color: #172132;
-                border: 1px solid #374a68;
-                color: #d7e5fb;
+                background-color: #09090b;
+                border: 1px solid #27272a;
+                color: #34d399;
             }
             QTableWidget {
-                background-color: #162131;
-                border: 1px solid #374a68;
-                gridline-color: #2e3f59;
-                alternate-background-color: #1a2739;
-                selection-background-color: #2b4872;
-                selection-color: #eaf3ff;
-                color: #d7e5fb;
+                background-color: #18181b;
+                border: 1px solid #27272a;
+                gridline-color: #27272a;
+                alternate-background-color: #121214;
+                selection-background-color: #312e81;
+                selection-color: #e0e7ff;
+                color: #e4e4e7;
             }
             QHeaderView::section {
-                background: #25344b;
-                color: #cde1ff;
-                border-right: 1px solid #374a68;
-                border-bottom: 1px solid #374a68;
+                background: #27272a;
+                color: #e4e4e7;
+                border-right: 1px solid #3f3f46;
+                border-bottom: 1px solid #3f3f46;
             }
-            QTableWidget QScrollBar:vertical {
-                background: #1d2b40;
+            
+            /* Custom Scrollbars Dark Mode */
+            QScrollBar:vertical {
+                background: #09090b;
+                width: 8px;
+                border-radius: 4px;
+                margin: 0px;
             }
-            QTableWidget QScrollBar::handle:vertical {
-                background: #4c658e;
+            QScrollBar::handle:vertical {
+                background: #27272a;
+                border-radius: 4px;
+                min-height: 20px;
             }
-            QTableWidget QScrollBar:horizontal {
-                background: #1d2b40;
+            QScrollBar::handle:vertical:hover {
+                background: #3f3f46;
             }
-            QTableWidget QScrollBar::handle:horizontal {
-                background: #4c658e;
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                background: none;
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background: #09090b;
+                height: 8px;
+                border-radius: 4px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #27272a;
+                border-radius: 4px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #3f3f46;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                background: none;
+                width: 0px;
+            }
+
+            /* Slider Dark Mode */
+            QSlider::groove:horizontal {
+                border: 1px solid #27272a;
+                height: 6px;
+                background: #09090b;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #8b5cf6;
+                border: none;
+                width: 14px;
+                height: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #7c3aed;
             }
             """
             self.setStyleSheet(base_styles + dark_overrides)
@@ -773,14 +1190,136 @@ class MainWindow(QMainWindow):
 
     def toggle_theme(self, checked: bool) -> None:
         self.dark_mode = checked
-        self.theme_button.setText("Light Theme" if checked else "Dark Theme")
+        self.theme_button.setText("☀️ Light Mode" if checked else "🌙 Dark Mode")
         self.apply_styles()
 
+    def update_concurrency_value(self, val: int) -> None:
+        self.max_concurrent = val
+        self.concurrency_label.setText(str(val))
+
+    def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
+            self.showNormal()
+            self.activateWindow()
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasText() or event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        urls_to_add = []
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                local_path = url.toLocalFile()
+                if local_path and Path(local_path).suffix == ".txt":
+                    try:
+                        with open(local_path, "r", encoding="utf-8") as f:
+                            urls_to_add.extend([line.strip() for line in f if line.strip()])
+                    except Exception as e:
+                        self.log_box.appendPlainText(f"Error reading dropped file: {e}")
+                else:
+                    urls_to_add.append(url.toString())
+        elif event.mimeData().hasText():
+            text = event.mimeData().text().strip()
+            urls_to_add.extend([line.strip() for line in text.splitlines() if line.strip()])
+
+        added = 0
+        quality = self.quality_combo.currentText()
+        for u in urls_to_add:
+            if u.startswith("http://") or u.startswith("https://") or "www." in u:
+                self._append_queue_row(u, quality)
+                added += 1
+
+        if added > 0:
+            self.log_box.appendPlainText(f"Dropped and queued {added} item(s).")
+            self.set_status(f"Queued {added} dropped link(s).", "idle")
+            self._update_queue_buttons()
+            event.acceptProposedAction()
+
+    def changeEvent(self, event) -> None:
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            clipboard = QApplication.clipboard()
+            text = clipboard.text().strip()
+            platforms = ["youtube.com", "youtu.be", "tiktok.com", "instagram.com", "twitter.com", "x.com"]
+            if any(p in text.lower() for p in platforms):
+                if not self.url_input.text().strip():
+                    self.url_input.setText(text)
+                    self.set_status("Detected video link in clipboard!", "idle")
+        elif event.type() == QEvent.WindowStateChange:
+            if self.isMinimized():
+                self.hide()
+                self.tray_icon.showMessage(
+                    "Universal Video Downloader",
+                    "Application minimized to system tray.",
+                    QSystemTrayIcon.Information,
+                    2000
+                )
+                event.accept()
+        super().changeEvent(event)
+
+    def paste_clipboard(self) -> None:
+        clipboard = QApplication.clipboard()
+        text = clipboard.text().strip()
+        if text:
+            self.url_input.setText(text)
+            self.set_status("Clipboard URL pasted.", "idle")
+        else:
+            self.set_status("Clipboard is empty.", "warning")
+
+    def analyze_url(self) -> None:
+        url = self.url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Missing URL", "Please enter a URL to analyze.")
+            return
+
+        self.set_status("Analyzing formats...", "active")
+        self.log_box.appendPlainText(f"Analyzing formats for {url}...")
+        self.analyze_button.setEnabled(False)
+        self.url_input.setEnabled(False)
+
+        cookie_file = self.cookies_input.text().strip()
+        
+        self.analyzer_thread = QThread()
+        self.analyzer_worker = FormatAnalyzerWorker(url, cookie_file)
+        self.analyzer_worker.moveToThread(self.analyzer_thread)
+
+        self.analyzer_thread.started.connect(self.analyzer_worker.run)
+        self.analyzer_worker.finished.connect(self.on_analyzer_finished)
+        self.analyzer_worker.finished.connect(self.analyzer_thread.quit)
+        self.analyzer_worker.finished.connect(self.analyzer_worker.deleteLater)
+        self.analyzer_thread.finished.connect(self.analyzer_thread.deleteLater)
+        self.analyzer_thread.finished.connect(self._clear_analyzer_references)
+
+        self.analyzer_thread.start()
+
+    def _clear_analyzer_references(self) -> None:
+        self.analyzer_thread = None
+        self.analyzer_worker = None
+
+    def on_analyzer_finished(self, success: bool, formats: list, error_msg: str) -> None:
+        self.analyze_button.setEnabled(True)
+        self.url_input.setEnabled(True)
+
+        if not success:
+            self.set_status("Analysis failed.", "error")
+            self.log_box.appendPlainText(f"Format analysis failed: {error_msg}")
+            QMessageBox.critical(self, "Analysis Failed", f"Failed to extract formats:\n{error_msg}")
+            return
+
+        self.quality_combo.clear()
+        for fmt in formats:
+            self.quality_combo.addItem(fmt["name"], fmt)
+
+        self.set_status("Format analysis complete.", "success")
+        self.log_box.appendPlainText(f"Found {len(formats)} format option(s).")
+
     def set_status(self, message: str, state: str) -> None:
-        self.status_label.setText(message)
-        self.status_label.setProperty("state", state)
-        self.style().unpolish(self.status_label)
-        self.style().polish(self.status_label)
+        if self.status_label.text() != message:
+            self.status_label.setText(message)
+        if self.status_label.property("state") != state:
+            self.status_label.setProperty("state", state)
+            self.style().unpolish(self.status_label)
+            self.style().polish(self.status_label)
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -838,14 +1377,28 @@ class MainWindow(QMainWindow):
 
     def _build_row_quality_combo(self, quality: str) -> QComboBox:
         combo = QComboBox()
-        combo.addItems(list(QUALITY_PRESETS.keys()))
-        combo.setCurrentText(quality if quality in QUALITY_PRESETS else "Best (Video + Audio)")
+        # If the main quality combo has custom items (with dict user data), copy them!
+        if self.quality_combo.itemData(0) is not None:
+            for idx in range(self.quality_combo.count()):
+                text = self.quality_combo.itemText(idx)
+                data = self.quality_combo.itemData(idx)
+                combo.addItem(text, data)
+            combo.setCurrentText(self.quality_combo.currentText())
+        else:
+            for name in QUALITY_PRESETS.keys():
+                combo.addItem(name)
+            combo.setCurrentText(quality if quality in QUALITY_PRESETS else "Best (Video + Audio)")
+        
         combo.setProperty("tableQuality", True)
         return combo
 
-    def _quality_for_row(self, row: int) -> str:
+    def _quality_for_row(self, row: int):
         widget = self.queue_table.cellWidget(row, self.COL_QUALITY)
         if isinstance(widget, QComboBox):
+            idx = widget.currentIndex()
+            data = widget.itemData(idx)
+            if data:
+                return data
             return widget.currentText()
 
         quality_item = self.queue_table.item(row, self.COL_QUALITY)
@@ -884,7 +1437,9 @@ class MainWindow(QMainWindow):
         for row in range(self.queue_table.rowCount()):
             item = self.queue_table.item(row, self.COL_STATUS)
             if item and item.text() == "Queued":
-                return row
+                # Ensure it is not currently downloading in active pool
+                if row not in self.active_downloads:
+                    return row
         return None
 
     def start_queue(self) -> None:
@@ -903,62 +1458,76 @@ class MainWindow(QMainWindow):
         self.queue_running = True
         self.stop_queue_requested = False
         self.progress_bar.setValue(0)
+        self.speed_chart.clear_history()
+        self.active_speeds.clear()
         self._set_quality_editable(False)
         self._update_queue_buttons()
-        self._start_next_item()
+        self._start_next_items()
 
-    def _start_next_item(self) -> None:
+    def _start_next_items(self) -> None:
         if self.stop_queue_requested:
-            self._finish_queue("Queue stopped.", "warning")
+            if not self.active_downloads:
+                self._finish_queue("Queue stopped.", "warning")
             return
 
-        next_row = self._next_queued_row()
-        if next_row is None:
+        while len(self.active_downloads) < self.max_concurrent:
+            next_row = self._next_queued_row()
+            if next_row is None:
+                break
+            self._start_download_item(next_row)
+
+        if not self.active_downloads and self._next_queued_row() is None:
             self._finish_queue("Queue completed.", "success")
-            return
+            self.tray_icon.showMessage(
+                "Universal Video Downloader",
+                "All downloads in the queue have completed!",
+                QSystemTrayIcon.Information,
+                3000
+            )
 
+    def _start_download_item(self, row: int) -> None:
         output_dir = self.output_input.text().strip()
         cookie_file = self.cookies_input.text().strip()
-        url_item = self.queue_table.item(next_row, self.COL_URL)
+        url_item = self.queue_table.item(row, self.COL_URL)
         if url_item is None:
-            self._set_row_status(next_row, "Failed")
-            self._set_row_progress(next_row, "0%")
-            self.log_box.appendPlainText(f"[Item {next_row + 1}] Invalid queue entry.")
-            self._start_next_item()
+            self._set_row_status(row, "Failed")
+            self._set_row_progress(row, "0%")
+            self.log_box.appendPlainText(f"[Item {row + 1}] Invalid queue entry.")
+            QTimer.singleShot(50, self._start_next_items)
             return
 
         url = url_item.text()
-        quality = self._quality_for_row(next_row)
-        self.current_row = next_row
+        quality = self._quality_for_row(row)
 
-        self._set_row_status(next_row, "Downloading")
-        self._set_row_progress(next_row, "0%")
-        self.progress_bar.setValue(0)
-        self.set_status(
-            f"Downloading item {next_row + 1}/{self.queue_table.rowCount()} ({quality})",
-            "active",
-        )
+        self._set_row_status(row, "Downloading")
+        self._set_row_progress(row, "0%")
+        self._update_overall_progress()
 
-        self.thread = QThread()
-        self.worker = DownloadWorker(url, output_dir, cookie_file, quality)
-        self.worker.moveToThread(self.thread)
+        thread = QThread()
+        worker = DownloadWorker(row, url, output_dir, cookie_file, quality)
+        worker.moveToThread(thread)
 
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.log.connect(self.on_log)
-        self.worker.finished.connect(self.on_item_finished)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.on_thread_finished)
-        self.thread.finished.connect(self.thread.deleteLater)
+        thread.started.connect(worker.run)
+        
+        worker.progress.connect(self.on_item_progress)
+        worker.speed_updated.connect(self.on_item_speed_updated)
+        worker.log.connect(self.on_item_log)
+        worker.finished.connect(self.on_item_finished)
+        
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.on_thread_finished)
 
+        self.active_downloads[row] = {"thread": thread, "worker": worker}
         self.cancel_button.setEnabled(True)
-        self.thread.start()
+        thread.start()
 
     def _finish_queue(self, message: str, state: str) -> None:
         self.queue_running = False
         self.stop_queue_requested = False
-        self.current_row = None
+        self.active_downloads.clear()
+        self.active_speeds.clear()
         self.cancel_button.setEnabled(False)
         self.progress_bar.setValue(100 if state == "success" else 0)
         self.set_status(message, state)
@@ -967,36 +1536,31 @@ class MainWindow(QMainWindow):
         self._update_queue_buttons()
 
     def cancel_download(self) -> None:
-        if self.worker:
-            self.stop_queue_requested = True
-            self.worker.cancel()
-            self.set_status("Cancelling current item...", "warning")
-            self.log_box.appendPlainText("Cancel requested...")
-            self.cancel_button.setEnabled(False)
-        elif self.queue_running:
-            self.stop_queue_requested = True
-            self.set_status("Stopping queue...", "warning")
+        self.stop_queue_requested = True
+        self.set_status("Stopping queue...", "warning")
+        self.log_box.appendPlainText("Cancel requested...")
+        
+        for info in list(self.active_downloads.values()):
+            worker = info.get("worker")
+            if worker:
+                worker.cancel()
+        
+        self.cancel_button.setEnabled(False)
 
-    def on_progress(self, percent: float, message: str) -> None:
-        row = self.current_row
-        self.progress_bar.setValue(max(0, min(100, int(percent))))
-        if row is not None:
-            self._set_row_progress(row, f"{percent:.1f}%")
-            self.set_status(f"Item {row + 1}: {message}", "active")
-        else:
-            self.set_status(message, "active")
+    def on_item_progress(self, row: int, percent: float, message: str) -> None:
+        self._set_row_progress(row, f"{percent:.1f}%")
+        self.set_status(f"Downloading {len(self.active_downloads)} item(s) concurrently...", "active")
+        self._update_overall_progress()
 
-    def on_log(self, message: str) -> None:
-        row = self.current_row
-        prefix = f"[Item {row + 1}] " if row is not None else ""
-        self.log_box.appendPlainText(f"{prefix}{message}")
+    def on_item_speed_updated(self, row: int, speed: float) -> None:
+        self.active_speeds[row] = speed
+        total_speed = sum(self.active_speeds.values())
+        self.speed_chart.add_sample(total_speed)
 
-    def on_item_finished(self, success: bool, message: str) -> None:
-        row = self.current_row
-        if row is None:
-            self.log_box.appendPlainText(message)
-            return
+    def on_item_log(self, row: int, message: str) -> None:
+        self.log_box.appendPlainText(f"[Item {row + 1}] {message}")
 
+    def on_item_finished(self, row: int, success: bool, message: str) -> None:
         lowered = message.lower()
         if success:
             row_status = "Done"
@@ -1007,7 +1571,6 @@ class MainWindow(QMainWindow):
             state = "warning"
             current_progress = self.queue_table.item(row, self.COL_PROGRESS)
             progress_text = current_progress.text() if current_progress else "0%"
-            self.stop_queue_requested = True
         else:
             row_status = "Failed"
             state = "error"
@@ -1015,17 +1578,53 @@ class MainWindow(QMainWindow):
 
         self._set_row_status(row, row_status)
         self._set_row_progress(row, progress_text)
-        self.set_status(message, state)
-        self.log_box.appendPlainText(f"[Item {row + 1}] {message}")
+        self.log_box.appendPlainText(f"[Item {row + 1}] Finished: {message}")
         self._update_queue_buttons()
+        self._update_overall_progress()
 
     def on_thread_finished(self) -> None:
-        self.worker = None
-        self.thread = None
-        self.current_row = None
-        self.cancel_button.setEnabled(False)
+        sender_thread = self.sender()
+        row = None
+        for r, info in self.active_downloads.items():
+            if info.get("thread") == sender_thread:
+                row = r
+                break
+
+        if row is not None:
+            if row in self.active_downloads:
+                del self.active_downloads[row]
+            if row in self.active_speeds:
+                del self.active_speeds[row]
+
+        if not self.active_downloads:
+            self.cancel_button.setEnabled(False)
+
         if self.queue_running:
-            self._start_next_item()
+            self._start_next_items()
+
+    def _update_overall_progress(self) -> None:
+        total_rows = self.queue_table.rowCount()
+        if total_rows == 0:
+            self.progress_bar.setValue(0)
+            return
+            
+        total_pct = 0.0
+        for r in range(total_rows):
+            status_item = self.queue_table.item(r, self.COL_STATUS)
+            if status_item:
+                status = status_item.text()
+                if status == "Done":
+                    total_pct += 100.0
+                elif status in ("Downloading", "Queued", "Canceled", "Failed"):
+                    prog_item = self.queue_table.item(r, self.COL_PROGRESS)
+                    if prog_item:
+                        try:
+                            pct_str = prog_item.text().replace("%", "")
+                            total_pct += float(pct_str)
+                        except ValueError:
+                            pass
+        avg_pct = total_pct / total_rows
+        self.progress_bar.setValue(int(avg_pct))
 
     def remove_selected_items(self) -> None:
         if self.queue_running:
@@ -1041,6 +1640,7 @@ class MainWindow(QMainWindow):
 
         self.set_status(f"Removed {len(selected_rows)} item(s).", "idle")
         self._update_queue_buttons()
+        self._update_overall_progress()
 
     def clear_finished_items(self) -> None:
         if self.queue_running:
@@ -1060,6 +1660,7 @@ class MainWindow(QMainWindow):
             self.set_status(f"Cleared {len(removable)} finished item(s).", "idle")
 
         self._update_queue_buttons()
+        self._update_overall_progress()
 
     def _update_queue_buttons(self) -> None:
         has_rows = self.queue_table.rowCount() > 0
@@ -1067,17 +1668,28 @@ class MainWindow(QMainWindow):
         has_selection = bool(self.queue_table.selectedIndexes())
 
         self.start_button.setEnabled(has_queued and not self.queue_running)
-        self.cancel_button.setEnabled(self.queue_running and self.worker is not None)
+        self.cancel_button.setEnabled(self.queue_running and len(self.active_downloads) > 0)
         self.remove_button.setEnabled(has_selection and not self.queue_running)
         self.clear_finished_button.setEnabled(has_rows and not self.queue_running)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self.worker:
-            self.stop_queue_requested = True
-            self.worker.cancel()
-        if self.thread and self.thread.isRunning():
-            self.thread.quit()
-            self.thread.wait(2000)
+        self.stop_queue_requested = True
+        
+        for info in list(self.active_downloads.values()):
+            worker = info.get("worker")
+            if worker:
+                worker.cancel()
+        
+        for info in list(self.active_downloads.values()):
+            thread = info.get("thread")
+            if thread and thread.isRunning():
+                thread.quit()
+                thread.wait(1000)
+                
+        if self.analyzer_thread and self.analyzer_thread.isRunning():
+            self.analyzer_thread.quit()
+            self.analyzer_thread.wait(1000)
+            
         super().closeEvent(event)
 
 
