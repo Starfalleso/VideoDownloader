@@ -35,6 +35,14 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
 
+def get_resource_path(relative_path: str) -> str:
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(os.path.dirname(__file__))
+    return str(Path(base_path) / relative_path)
+
+
 def sanitize_filename(name: str) -> str:
     return re.sub(r"[\\/:*?\"<>|]+", "_", name).strip() or "video"
 
@@ -334,7 +342,7 @@ class MainWindow(QMainWindow):
             pass
 
         # Set Window Icon
-        icon_path = Path("icon.ico")
+        icon_path = Path(get_resource_path("icon.ico"))
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
         else:
@@ -454,7 +462,7 @@ class MainWindow(QMainWindow):
 
         # System Tray Icon Setup
         self.tray_icon = QSystemTrayIcon(self)
-        icon_path = Path("icon.ico")
+        icon_path = Path(get_resource_path("icon.ico"))
         if icon_path.exists():
             self.tray_icon.setIcon(QIcon(str(icon_path)))
         else:
@@ -1249,9 +1257,9 @@ class MainWindow(QMainWindow):
             if self.isMinimized():
                 self.hide()
                 self.tray_icon.showMessage(
-                    "Universal Video Downloader",
+                    "Video Downloader",
                     "Application minimized to system tray.",
-                    QSystemTrayIcon.Information,
+                    self.windowIcon(),
                     2000
                 )
                 event.accept()
@@ -1479,9 +1487,9 @@ class MainWindow(QMainWindow):
         if not self.active_downloads and self._next_queued_row() is None:
             self._finish_queue("Queue completed.", "success")
             self.tray_icon.showMessage(
-                "Universal Video Downloader",
+                "Video Downloader",
                 "All downloads in the queue have completed!",
-                QSystemTrayIcon.Information,
+                self.windowIcon(),
                 3000
             )
 

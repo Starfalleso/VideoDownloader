@@ -13,7 +13,7 @@ a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[("icon.ico", ".")],
     hiddenimports=yt_dlp_hidden,
     hookspath=[],
     hooksconfig={},
